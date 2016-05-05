@@ -5,10 +5,9 @@
 # pylint: disable=redefined-builtin,unidiomatic-typecheck,eval-used,exec-used
 
 import ast
+import builtins
 import code
-import datetime
 import inspect
-import re
 import sys
 import types
 
@@ -33,9 +32,14 @@ _SAFE_BUILTINS = (
     "staticmethod", "str", "sum", "super", "tuple", "zip"
 )
 
+_SAFE_MODULES = frozenset((
+    "cmath",
+    "math",
+))
+
 _UNSAFE_NAMES = frozenset((
     # Python 3.5 coroutine objects
-    "cb_frame",
+    "cr_code", "cr_frame",
     # Frame objects
     "f_back", "f_builtins", "f_code", "f_locals", "f_globals",
     # Generator objects
@@ -87,7 +91,33 @@ def _safe_setattr(obj, name, value):
 
 
 def _check_name(name):
-    return not (name.startswith("_") or name in _UNSAFE_NAMES)
+    return name == "_" or not (name.startswith("_") or name in _UNSAFE_NAMES)
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if type(name) is not str:
+        raise TypeError("Invalid type passed as name to __import__")
+    if (fromlist is not None and type(fromlist) is not tuple and
+            type(fromlist) is not list):
+        raise TypeError("Invalid type passed as fromlist to __import__")
+    if type(level) is not int:
+        raise TypeError("Invalid type passed as level to __import__")
+    if globals is None or locals is None:
+        raise ImportError("globals and locals must be passed to __import__")
+    if fromlist:
+        for fromitem in fromlist:
+            if type(fromitem) is not str or not _check_name(fromitem):
+                raise ImportError("Not allowed to access private attributes")
+    if level != 0:
+        raise ImportError("Only absolute imports are allowed")
+    if name not in _SAFE_MODULES:
+        raise ImportError("Only white-listed imports are allowed")
+    namespace = inspect.currentframe().f_back.f_globals
+    if name in namespace["__modules__"]:
+        return namespace["__modules__"][name]
+    module = _copy_module(__import__(name, globals, locals, fromlist, 0))
+    namespace["__modules__"][name] = module
+    return module
 
 
 def safe_compile(untrusted_source, filename, mode):
@@ -119,7 +149,8 @@ def _copy_module(module, include=None, exclude=None):
         type_ = type(value)
         if value is None or type_ in (bool, bytes, float, int, str):
             setattr(copied, name, value)
-        elif type_ in (types.FunctionType, types.LambdaType):
+        elif type_ in (types.FunctionType, types.LambdaType,
+                       types.BuiltinFunctionType):
             def func_proxy(func):
                 """Return a proxy for the given function."""
                 # pylint: disable=unnecessary-lambda
@@ -143,12 +174,12 @@ def safe_namespace(additional=None):
     """
     namespace = {
         "__builtins__": dict(
-            (name, getattr(__builtins__, name)) for name in _SAFE_BUILTINS),
+            (name, getattr(builtins, name)) for name in _SAFE_BUILTINS),
         "__name__": "__script__",
-        "datetime": _copy_module(datetime),
-        "re": _copy_module(re),
+        "__modules__": {},
     }
     namespace["__builtins__"].update(
+        __import__=_safe_import,
         dir=_safe_dir,
         eval=_safe_eval,
         exec=_safe_exec,
@@ -186,10 +217,11 @@ class SafeInteractiveConsole(code.InteractiveConsole):
     def __init__(self, additional=None):
         super().__init__(locals=safe_namespace(additional))
         compiler = self.compile
+        pass_code = compile("pass", "", "exec").co_code
         def safe_compiler(source, filename, symbol):
             """Compile and verify the code."""
             compiled = compiler(source, filename, symbol)
-            if compiled is not None:
+            if compiled is not None and compiled.co_code != pass_code:
                 safe_compile(source, filename, symbol)
             return compiled
         self.compile = safe_compiler
